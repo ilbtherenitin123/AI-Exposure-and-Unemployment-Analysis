@@ -1,0 +1,442 @@
+
+---
+
+## 2️⃣ `code/ai_exposure_G4_analysis.R` (cleaned)
+
+Create `code/ai_exposure_G4_analysis.R` and paste:
+
+```r
+# ============================================================================
+# AI EXPOSURE ANALYSIS - GRADIENT 4 ABSOLUTE THRESHOLD
+# ============================================================================
+# Author: Nitin Ranjan
+# Description:
+#   - Uses ILOSTAT employment-by-occupation data and ILO (2025) exposure scores
+#   - Implements the ILO Gradient framework with an absolute G4 threshold
+#   - Aggregates exposure to ISCO-1 level and computes country-level indices
+#   - Produces summary tables and figures used in the AI exposure paper
+#
+# Requirements:
+#   - Place the following files in data/:
+#       1) ilo_employment_by_occupation.csv
+#       2) ilo_2025_exposure_by_isco4.xlsx
+#   - R packages: tidyverse, readxl, janitor
+#
+# Outputs (written to outputs/):
+#   - country_exposure_G4_FINAL.csv
+#   - table1_summary_G4.csv
+#   - table_top15_countries_G4.csv
+#   - table_bottom15_countries_G4.csv
+#   - isco1_exposure_G4.csv
+#   - isco4_gradients_G4.csv
+#   - fig1_exposure_distribution_G4.png
+#   - fig2_exposure_vs_isco4_G4.png
+#   - fig3_G3G4_vs_G4.png
+# ============================================================================
+
+library(tidyverse)
+library(readxl)
+library(janitor)
+
+# Paths (relative to project root)
+DATA_DIR <- "data"
+OUT_DIR  <- "outputs"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+cat("=============================================================\n")
+cat("   AI EXPOSURE ANALYSIS - GRADIENT 4 (ABSOLUTE THRESHOLD)\n")
+cat("=============================================================\n\n")
+cat("Data folder:   ", DATA_DIR, "\n")
+cat("Output folder: ", OUT_DIR, "\n\n")
+
+# ============================================================================
+# STEP 1: LOAD EMPLOYMENT DATA
+# ============================================================================
+
+cat("STEP 1: Loading employment data...\n")
+cat("-------------------------------------------------------------\n\n")
+
+employment_file <- file.path(DATA_DIR, "ilo_employment_by_occupation.csv")
+
+if (!file.exists(employment_file)) {
+  cat("ERROR: Cannot find employment file:\n")
+  cat("  Expected:", employment_file, "\n")
+  cat("\nAvailable CSV files in data folder:\n")
+  print(list.files(DATA_DIR, pattern = "\\.csv$"))
+  stop("Employment file not found")
+}
+
+ilo_raw <- read_csv(employment_file, show_col_types = FALSE)
+
+cat("✓ Loaded employment data\n")
+cat("  Rows:", nrow(ilo_raw), "\n")
+cat("  Columns (first few):", paste(names(ilo_raw)[1:min(5, ncol(ilo_raw))],
+                                    collapse = ", "), "...\n\n")
+
+# ============================================================================
+# STEP 2: CLEAN EMPLOYMENT DATA
+# ============================================================================
+
+cat("STEP 2: Cleaning employment data...\n")
+cat("-------------------------------------------------------------\n\n")
+
+ilo_clean <- ilo_raw %>%
+  filter(
+    is.na(sex.label) |
+      sex.label %in% c("Total", "Both sexes", "Sex: Total")
+  ) %>%
+  mutate(
+    isco_1d = str_extract(classif1.label, "(?<=ISCO-08\\):)\\s*\\d"),
+    isco_1d = if_else(
+      is.na(isco_1d),
+      str_extract(classif1.label, "^\\s*\\d"),
+      isco_1d
+    ),
+    isco_1d = str_trim(isco_1d)
+  ) %>%
+  filter(!is.na(isco_1d), isco_1d %in% as.character(0:9)) %>%
+  filter(!is.na(obs_value), obs_value > 0) %>%
+  select(
+    country_name = ref_area.label,
+    year = time,
+    isco_1d,
+    occupation_label = classif1.label,
+    employment = obs_value
+  )
+
+# Keep latest year per country
+ilo_latest <- ilo_clean %>%
+  group_by(country_name) %>%
+  filter(year == max(year)) %>%
+  ungroup()
+
+cat("✓ Cleaned employment data\n")
+cat("  Countries:", n_distinct(ilo_latest$country_name), "\n")
+cat("  Latest years:", min(ilo_latest$year), "to", max(ilo_latest$year), "\n\n")
+
+# ============================================================================
+# STEP 3: CALCULATE EMPLOYMENT SHARES
+# ============================================================================
+
+cat("STEP 3: Calculating employment shares...\n")
+cat("-------------------------------------------------------------\n\n")
+
+employment_with_shares <- ilo_latest %>%
+  group_by(country_name, isco_1d) %>%
+  summarise(
+    employment = sum(employment, na.rm = TRUE),
+    year = first(year),
+    .groups = "drop"
+  ) %>%
+  group_by(country_name) %>%
+  mutate(
+    total_employment = sum(employment),
+    employment_share = employment / total_employment
+  ) %>%
+  ungroup()
+
+cat("✓ Employment shares calculated\n")
+cat("  Total country-occupation pairs:", nrow(employment_with_shares), "\n\n")
+
+# ============================================================================
+# STEP 4: LOAD ILO 2025 EXPOSURE DATA
+# ============================================================================
+
+cat("STEP 4: Loading ILO 2025 exposure data...\n")
+cat("-------------------------------------------------------------\n\n")
+
+expo_file <- file.path(DATA_DIR, "ilo_2025_exposure_by_isco4.xlsx")
+
+if (!file.exists(expo_file)) {
+  cat("ERROR: Cannot find exposure file:\n")
+  cat("  Expected:", expo_file, "\n")
+  cat("\nAvailable XLSX files in data folder:\n")
+  print(list.files(DATA_DIR, pattern = "\\.xlsx$"))
+  stop("Exposure file not found")
+}
+
+xl <- read_excel(expo_file, sheet = 1) %>% clean_names()
+
+cat("✓ Loaded exposure file\n")
+cat("  Rows:", nrow(xl), "\n")
+cat("  Columns:\n")
+print(names(xl))
+cat("\n")
+
+# ============================================================================
+# STEP 5: EXTRACT EXPOSURE SCORES (MEAN AND SD)
+# ============================================================================
+
+cat("STEP 5: Extracting exposure scores...\n")
+cat("-------------------------------------------------------------\n\n")
+
+expo4 <- xl %>%
+  transmute(
+    isco4 = str_pad(
+      str_extract(as.character(x4_digit_code), "\\d{4}"),
+      4,
+      pad = "0"
+    ),
+    exp_mean = suppressWarnings(as.numeric(mean)),
+    exp_sd = suppressWarnings(as.numeric(sd))
+  ) %>%
+  filter(!is.na(isco4), is.finite(exp_mean), is.finite(exp_sd))
+
+cat("✓ Extracted exposure scores\n")
+cat("  4-digit occupations:", nrow(expo4), "\n")
+cat("  Mean exposure range:", round(min(expo4$exp_mean), 2), "to",
+    round(max(expo4$exp_mean), 2), "\n\n")
+
+# ============================================================================
+# STEP 6: CLASSIFY INTO GRADIENTS (ABSOLUTE THRESHOLD)
+# ============================================================================
+
+cat("STEP 6: Classifying into gradients (absolute threshold)...\n")
+cat("-------------------------------------------------------------\n\n")
+
+expo4_with_gradient <- expo4 %>%
+  mutate(
+    mean_minus_sd = exp_mean - exp_sd,
+
+    # Absolute thresholds (ILO 2025 Table 5)
+    gradient = case_when(
+      exp_mean >= 0.6 & mean_minus_sd >= 0.5 ~ 4,  # Very High (G4)
+      exp_mean >= 0.5 & mean_minus_sd >= 0.4 ~ 3,  # High (G3)
+      exp_mean >= 0.4 & mean_minus_sd >= 0.3 ~ 2,  # Medium (G2)
+      TRUE ~ 1                                     # Low (G1)
+    ),
+
+    gradient_label = case_when(
+      gradient == 4 ~ "Gradient 4: Very High",
+      gradient == 3 ~ "Gradient 3: High",
+      gradient == 2 ~ "Gradient 2: Medium",
+      gradient == 1 ~ "Gradient 1: Low"
+    )
+  )
+
+gradient_dist <- expo4_with_gradient %>%
+  count(gradient, gradient_label) %>%
+  arrange(desc(gradient))
+
+cat("✓ Gradient classification summary:\n")
+print(gradient_dist)
+cat("\n")
+
+cat("Gradient 4 threshold: exp_mean >= 0.6 AND (mean - sd) >= 0.5\n")
+cat("Occupations in G4:", sum(expo4_with_gradient$gradient == 4), "\n\n")
+
+# ============================================================================
+# STEP 7: AGGREGATE TO ISCO-1 WITH GRADIENT SHARES
+# ============================================================================
+
+cat("STEP 7: Aggregating to ISCO-1 level...\n")
+cat("-------------------------------------------------------------\n\n")
+
+expo1 <- expo4_with_gradient %>%
+  mutate(isco_1d = substr(isco4, 1, 1)) %>%
+  group_by(isco_1d) %>%
+  summarise(
+    avg_mean = mean(exp_mean, na.rm = TRUE),
+    avg_sd = mean(exp_sd, na.rm = TRUE),
+    share_gradient_4 = mean(gradient == 4),
+    share_gradient_3_4 = mean(gradient >= 3),
+    n_occupations = n(),
+    n_gradient_4 = sum(gradient == 4),
+    n_gradient_3_4 = sum(gradient >= 3),
+    .groups = "drop"
+  )
+
+cat("✓ ISCO-1 exposure summary:\n")
+print(expo1 %>% select(isco_1d, n_occupations, n_gradient_4, share_gradient_4))
+cat("\n")
+
+# ============================================================================
+# STEP 8: MERGE EMPLOYMENT WITH EXPOSURE
+# ============================================================================
+
+cat("STEP 8: Merging employment with exposure...\n")
+cat("-------------------------------------------------------------\n\n")
+
+merged_data <- employment_with_shares %>%
+  left_join(expo1, by = "isco_1d") %>%
+  filter(!is.na(avg_mean))
+
+cat("✓ Merge successful\n")
+cat("  Rows:", nrow(merged_data), "\n")
+cat("  Countries:", n_distinct(merged_data$country_name), "\n\n")
+
+# ============================================================================
+# STEP 9: CALCULATE COUNTRY-LEVEL EXPOSURE
+# ============================================================================
+
+cat("STEP 9: Calculating country-level exposure...\n")
+cat("-------------------------------------------------------------\n\n")
+
+country_exposure <- merged_data %>%
+  group_by(country_name) %>%
+  summarise(
+    exposure_g4 = sum(employment_share * share_gradient_4, na.rm = TRUE) * 100,
+    exposure_g3_g4 = sum(employment_share * share_gradient_3_4, na.rm = TRUE) * 100,
+    isco4_share = sum(employment_share[isco_1d == "4"], na.rm = TRUE) * 100,
+    isco6_share = sum(employment_share[isco_1d == "6"], na.rm = TRUE) * 100,
+    year = first(year),
+    total_emp = first(total_employment),
+    .groups = "drop"
+  )
+
+cat("✓ Country exposure calculated\n")
+cat("  Countries:", nrow(country_exposure), "\n\n")
+
+# ============================================================================
+# STEP 10: SUMMARY STATISTICS
+# ============================================================================
+
+cat("STEP 10: Computing summary statistics...\n")
+cat("-------------------------------------------------------------\n\n")
+
+summary_stats <- country_exposure %>%
+  summarise(
+    N = n(),
+    Mean = mean(exposure_g4, na.rm = TRUE),
+    Median = median(exposure_g4, na.rm = TRUE),
+    SD = sd(exposure_g4, na.rm = TRUE),
+    Min = min(exposure_g4, na.rm = TRUE),
+    Q10 = quantile(exposure_g4, 0.1, na.rm = TRUE),
+    Q25 = quantile(exposure_g4, 0.25, na.rm = TRUE),
+    Q75 = quantile(exposure_g4, 0.75, na.rm = TRUE),
+    Q90 = quantile(exposure_g4, 0.9, na.rm = TRUE),
+    Max = max(exposure_g4, na.rm = TRUE)
+  )
+
+cat("Gradient 4 exposure statistics:\n")
+print(summary_stats %>% mutate(across(where(is.numeric), ~round(., 3))))
+cat("\n")
+
+top15 <- country_exposure %>%
+  arrange(desc(exposure_g4)) %>%
+  head(15) %>%
+  select(country_name, exposure_g4, isco4_share, isco6_share)
+
+cat("Top 15 countries by G4 exposure:\n")
+print(top15 %>% mutate(across(where(is.numeric), ~round(., 2))))
+cat("\n")
+
+bottom15 <- country_exposure %>%
+  arrange(exposure_g4) %>%
+  head(15) %>%
+  select(country_name, exposure_g4, isco4_share, isco6_share)
+
+cat("Bottom 15 countries by G4 exposure:\n")
+print(bottom15 %>% mutate(across(where(is.numeric), ~round(., 2))))
+cat("\n")
+
+# ============================================================================
+# STEP 11: SAVE OUTPUT FILES
+# ============================================================================
+
+cat("STEP 11: Saving output files...\n")
+cat("-------------------------------------------------------------\n\n")
+
+write_csv(country_exposure, file.path(OUT_DIR, "country_exposure_G4_FINAL.csv"))
+write_csv(summary_stats,  file.path(OUT_DIR, "table1_summary_G4.csv"))
+write_csv(top15,          file.path(OUT_DIR, "table_top15_countries_G4.csv"))
+write_csv(bottom15,       file.path(OUT_DIR, "table_bottom15_countries_G4.csv"))
+write_csv(expo1,          file.path(OUT_DIR, "isco1_exposure_G4.csv"))
+write_csv(expo4_with_gradient, file.path(OUT_DIR, "isco4_gradients_G4.csv"))
+
+cat("✓ Tables saved to outputs/\n\n")
+
+# ============================================================================
+# STEP 12: GENERATE FIGURES
+# ============================================================================
+
+cat("STEP 12: Generating figures...\n")
+cat("-------------------------------------------------------------\n\n")
+
+fig1 <- ggplot(country_exposure, aes(x = exposure_g4)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black", alpha = 0.7) +
+  geom_vline(xintercept = mean(country_exposure$exposure_g4), 
+             color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(xintercept = median(country_exposure$exposure_g4), 
+             color = "orange", linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Distribution of AI Exposure (Gradient 4)",
+    subtitle = sprintf("Mean = %.2f%%, Median = %.2f%%",
+                       mean(country_exposure$exposure_g4),
+                       median(country_exposure$exposure_g4)),
+    x = "AI Exposure (G4, % of employment)",
+    y = "Number of Countries"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(OUT_DIR, "fig1_exposure_distribution_G4.png"),
+       fig1, width = 10, height = 6, dpi = 300)
+
+fig2 <- ggplot(country_exposure,
+               aes(x = isco4_share, y = exposure_g4)) +
+  geom_point(alpha = 0.6, size = 3, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", linewidth = 1) +
+  labs(
+    title = "AI Exposure vs Clerical Employment (ISCO-4)",
+    subtitle = sprintf("Correlation = %.3f",
+                       cor(country_exposure$isco4_share,
+                           country_exposure$exposure_g4, use = "complete.obs")),
+    x = "Clerical Workers (% of employment)",
+    y = "AI Exposure (G4, %)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(OUT_DIR, "fig2_exposure_vs_isco4_G4.png"),
+       fig2, width = 10, height = 6, dpi = 300)
+
+fig3 <- ggplot(country_exposure,
+               aes(x = exposure_g4, y = exposure_g3_g4)) +
+  geom_point(alpha = 0.6, size = 3, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Sensitivity: Gradient 3+4 vs Gradient 4 Only",
+    subtitle = "Dashed line shows 1:1 relationship",
+    x = "Gradient 4 Only (% of employment)",
+    y = "Gradients 3+4 Combined (% of employment)"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(OUT_DIR, "fig3_G3G4_vs_G4.png"),
+       fig3, width = 10, height = 6, dpi = 300)
+
+cat("✓ Figures saved to outputs/\n\n")
+
+# ============================================================================
+# FINAL SUMMARY
+# ============================================================================
+
+cat("=============================================================\n")
+cat("                 ANALYSIS COMPLETE\n")
+cat("=============================================================\n\n")
+
+cat("Key results (Gradient 4, absolute threshold):\n")
+cat("  Global mean exposure:",
+    round(mean(country_exposure$exposure_g4), 2), "%\n")
+cat("  Median exposure:     ",
+    round(median(country_exposure$exposure_g4), 2), "%\n")
+cat("  Range:               ",
+    round(min(country_exposure$exposure_g4), 2), "% to",
+    round(max(country_exposure$exposure_g4), 2), "%\n\n")
+
+# Optional checks for specific countries (if present)
+japan <- country_exposure %>%
+  filter(grepl("Japan", country_name, ignore.case = TRUE))
+if (nrow(japan) > 0) {
+  cat("  Japan exposure:      ",
+      round(japan$exposure_g4[1], 2), "%\n")
+}
+
+puerto_rico <- country_exposure %>%
+  filter(grepl("Puerto Rico", country_name, ignore.case = TRUE))
+if (nrow(puerto_rico) > 0) {
+  cat("  Puerto Rico exposure:",
+      round(puerto_rico$exposure_g4[1], 2), "%\n")
+}
+
+cat("\nOutputs written to:", normalizePath(OUT_DIR), "\n\n")
